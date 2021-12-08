@@ -1,0 +1,256 @@
+/*
+* @Author: Yajun
+* @Date:   2021/11/10 22:58
+ */
+
+package matrix
+
+import (
+	"fmt"
+	"github.com/yinyajun/golearn/utils"
+	"math"
+	"runtime"
+
+	"gonum.org/v1/gonum/mat"
+)
+
+const (
+	AnyKNN = "any" // (i,j) in R || (j,i) in R
+	AllKNN = "all" // (i,j) in R && (j,i) in R
+)
+
+type Distances struct {
+	points      *mat.Dense
+	Index       []int
+	Metric      utils.Metric
+	Filters     []DistancesFilter
+	NGoroutines int
+}
+
+func NewDistances(points *mat.Dense) *Distances {
+	nSamples, _ := points.Dims()
+	d := &Distances{
+		points:      points,
+		Index:       utils.Range(0, nSamples, 1),
+		Metric:      utils.CosineSim,
+		NGoroutines: runtime.NumCPU() / 2,
+	}
+	return d
+}
+
+func (d *Distances) Len() int { return len(d.Index) }
+
+// Cartesian returns {<x, x> | x in Index && y in b}
+func (d *Distances) Cartesian(idx []int) *mat.Dense {
+	var (
+		limit = make(chan int, d.NGoroutines)
+		res   = mat.NewDense(d.Len(), len(idx), nil)
+	)
+
+	// 计算距离矩阵
+	for i := 0; i < d.Len(); i++ {
+		for j, _ := range idx {
+			limit <- 1
+			go func(i, j int) {
+				metric := d.Metric(d.points.RowView(d.Index[i]), d.points.RowView(idx[j]))
+				res.Set(i, j, metric)
+				<-limit
+			}(i, j)
+		}
+	}
+	for i := 0; i < d.NGoroutines; i++ { // 确保最后一批goroutine完成job
+		limit <- 1
+	}
+	close(limit)
+	// 过滤
+	for _, f := range d.Filters {
+		f.FilterDense(res)
+	}
+	return res
+}
+
+// SysCartesian returns {<x, y>| x, y in Index}
+func (d *Distances) SysCartesian() *mat.SymDense {
+	var (
+		limit = make(chan int, d.NGoroutines)
+		res   = mat.NewSymDense(d.Len(), nil)
+	)
+
+	// 计算距离矩阵
+	for i := 0; i < d.Len(); i++ {
+		for j := i + 1; j < d.Len(); j++ {
+			limit <- 1
+			go func(i, j int) {
+				res.SetSym(i, j, d.Metric(d.points.RowView(d.Index[i]), d.points.RowView(d.Index[j])))
+				<-limit
+			}(i, j)
+		}
+	}
+	for i := 0; i < d.NGoroutines; i++ { // 确保最后一批goroutine完成job
+		limit <- 1
+	}
+	close(limit)
+
+	//showMatrix(res)
+	// 过滤
+	for _, f := range d.Filters {
+		f.FilterSymmetric(res)
+	}
+	return res
+}
+
+func (d *Distances) AddFilter(f DistancesFilter) {
+	d.Filters = append(d.Filters, f)
+}
+
+type DistancesFilter interface {
+	FilterSymmetric(*mat.SymDense)
+	FilterDense(dense *mat.Dense)
+}
+
+type KNNFilter struct {
+	Typ string
+	// any relationship: (i,j) in R || (j,i) in R
+	// all relationship: (i,j) in R && (j,i) in R, De Morgan's Law: (p,q) not in R || (q,p) not in R
+	K int
+}
+
+func (f *KNNFilter) FilterSymmetric(m *mat.SymDense) {
+	var rmMark func(int, int)
+
+	switch f.Typ {
+	case AllKNN:
+		rmMark = func(i, j int) {
+			if m.At(i, j) < 0 {
+				m.SetSym(i, j, 0)
+			}
+		}
+	case AnyKNN:
+		rmMark = func(i, j int) {
+			if m.At(i, j) < 0 {
+				m.SetSym(i, j, -m.At(i, j))
+			} else {
+				m.SetSym(i, j, 0)
+			}
+		}
+	default:
+		panic("Unsupported type for KNN filter")
+	}
+
+	var (
+		r, c   = m.Dims()
+		nums   = make([]float64, c)
+		knnIdx []int
+	)
+
+	// 逐行标记(all:非K邻近, any:k邻近)
+	for i := 0; i < r; i++ {
+		// copy
+		for j := 0; j < c; j++ {
+			nums[j] = math.Abs(m.At(i, j))
+		}
+		//fmt.Println(i)
+		//showVector(nums)
+
+		if f.Typ == AllKNN {
+			knnIdx = utils.KSmallest(nums, c-f.K)
+		} else {
+			knnIdx = utils.KBiggest(nums, f.K)
+		}
+		//fmt.Println(knnIdx)
+
+		for _, j := range knnIdx {
+			if m.At(i, j) > 0 {
+				m.SetSym(i, j, -m.At(i, j)) // 符号标记
+			}
+		}
+	}
+
+	//showMatrix(m)
+
+	// 清除标记
+	for i := 0; i < r; i++ {
+		for j := i + 1; j < c; j++ {
+			rmMark(i, j)
+		}
+	}
+}
+
+func (f *KNNFilter) FilterDense(m *mat.Dense) {
+	var rmMark func(int, int)
+
+	switch f.Typ {
+	case AllKNN:
+		rmMark = func(i, j int) {
+			if m.At(i, j) < 0 {
+				m.Set(i, j, 0)
+			}
+		}
+	case AnyKNN:
+		rmMark = func(i, j int) {
+			if m.At(i, j) < 0 {
+				m.Set(i, j, -m.At(i, j))
+			} else {
+				m.Set(i, j, 0)
+			}
+		}
+	default:
+		panic("Unsupported type for KNN filter")
+	}
+
+	var (
+		r, c   = m.Dims()
+		nums   = make([]float64, c)
+		knnIdx []int
+	)
+
+	// 逐行标记(all:非K邻近, any:k邻近)
+	for i := 0; i < r; i++ {
+		for j := 0; j < c; j++ {
+			nums[j] = math.Abs(m.At(i, j))
+		}
+		//fmt.Println(i)
+		//showVector(nums)
+
+		if f.Typ == AllKNN {
+			knnIdx = utils.KSmallest(nums, c-f.K)
+		} else {
+			knnIdx = utils.KBiggest(nums, f.K)
+		}
+		//fmt.Println(knnIdx)
+
+		for _, j := range knnIdx {
+			if m.At(i, j) > 0 {
+				m.Set(i, j, -m.At(i, j)) // 符号标记
+			}
+		}
+	}
+	//showMatrix(m)
+
+	// 清除标记
+	for i := 0; i < r; i++ {
+		for j := 0; j < c; j++ {
+			rmMark(i, j)
+		}
+	}
+}
+
+func showMatrix(s mat.Matrix) {
+	m, n := s.Dims()
+	for i := 0; i < m; i++ {
+		for j := 0; j < n; j++ {
+			fmt.Printf("%02f   ", s.At(i, j))
+		}
+		fmt.Println()
+	}
+	fmt.Println("----------------------")
+}
+
+func showVector(v []float64) {
+	fmt.Printf("[")
+	for _, n := range v {
+		fmt.Printf("%02f ", n)
+	}
+	fmt.Printf("]")
+	fmt.Println()
+}
